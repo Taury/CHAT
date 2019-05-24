@@ -1,0 +1,407 @@
+#include "mainwin.h"
+#include "ui_mainwin.h"
+#include <QHostAddress>
+#include <QHostInfo>
+#include <QMessageBox>
+#include <QFileDialog>
+
+MainWin::MainWin(QWidget *parent) :
+    QMainWindow(parent),
+    ui(new Ui::MainWin)
+{
+    ui->setupUi(this);
+
+    QSqlDatabase db = QSqlDatabase::addDatabase("QSQLITE");
+    db.setDatabaseName("mydatebase.db");
+    if(!db.open())
+    {
+        qDebug()<<"Open database failed!";
+    }
+    QSqlQuery query;
+    query.exec("select count(*) from sqlite_master where type='table' and name='record';");
+    if(query.next())
+    {
+        if(query.value(0).toInt() == 0)
+            query.exec("create table record(ipAddr text,message text,filePath text,savePath text,fileSize int);");
+        else
+            query.exec("delete from record;");
+    }
+
+    ui->pushButton_connect->setEnabled(false);
+    mServer = NULL;
+    mSocket = NULL;
+    clientSock.clear();    
+}
+
+MainWin::~MainWin()
+{
+    delete ui;
+}
+
+void MainWin::newConnect()
+{
+    ui->label_connect->setStyleSheet("background-color: rgb(00, 255, 0);border:1px solid#000000;border-radius:10px;");
+    mSocket = mServer->nextPendingConnection();
+    clientSock.append(mSocket);
+    ui->comboBox_client->addItem(mSocket->peerAddress().toString());
+
+    connect(mSocket,SIGNAL(readyRead()),this, SLOT(read_data()));
+    connect(mSocket,SIGNAL(disconnected()),this, SLOT(disConnect()));
+}
+
+// 断开连接
+void MainWin::disConnect()
+{
+    QTcpSocket *sock = static_cast<QTcpSocket *>(sender());
+    int row = clientSock.indexOf(sock);
+    if(mode == TcpServer)
+    {
+        clientSock.removeAll(sock);
+        clientSock.at(row)->destroyed();
+        ui->comboBox_client->removeItem(row);
+
+        if(clientSock.length() == 0)
+        {
+            ui->label_connect->setStyleSheet("background-color: rgb(206, 206, 206);border:1px solid#000000;border-radius:10px;");
+        }
+    }
+    else
+    {
+        mSocket->close();
+        ui->pushButton_connect->setText("开始连接");
+        ui->label_connect->setStyleSheet("background-color: rgb(206, 206, 206);border:1px solid#000000;border-radius:10px;");
+    }
+}
+
+// Tcp Server 模式
+void MainWin::on_radioButton_TcpSvr_clicked()
+{    
+    mode = TcpServer;
+    ui->pushButton_connect->setEnabled(true);
+    QHostInfo hostinfo = QHostInfo::fromName(QHostInfo::localHostName());
+
+    foreach (QHostAddress addr, hostinfo.addresses())
+    {
+        if(addr.protocol() == QAbstractSocket::IPv4Protocol)
+        {
+            ui->pushButton_connect->setText("开始监听");
+            ui->lineEdit_IP->setText(addr.toString());
+        }
+    }
+}
+
+// Tcp Client 模式
+void MainWin::on_radioButton_TcpClt_clicked()
+{
+    mode = TcpClient;
+    ui->pushButton_connect->setEnabled(true);
+    ui->pushButton_connect->setText("开始连接");
+    ui->lineEdit_IP->clear();
+
+    for(int i=0; i<clientSock.length(); i++)
+    {
+        clientSock.at(i)->disconnectFromHost();
+        clientSock.removeAt(i);
+
+    }
+    if(mServer != NULL && mServer->isListening())
+    {
+        delete mServer;
+        mServer = NULL;
+    }
+    ui->label_connect->setStyleSheet("background-color: rgb(206, 206, 206);border:1px solid#000000;border-radius:10px;");
+}
+
+// 连接/断开
+void MainWin::on_pushButton_connect_clicked()
+{
+    if(ui->pushButton_connect->text() == "开始监听")
+    {
+        mServer = new QTcpServer();
+        if(mServer->listen(static_cast<QHostAddress> (ui->lineEdit_IP->text()), ui->lineEdit_port->text().toInt()))
+        {
+            connect(mServer,SIGNAL(newConnection()),this, SLOT(newConnect()));
+            ui->pushButton_connect->setText("停止监听");
+        }
+        else
+            QMessageBox::warning(this,"警告","监听失败");
+    }
+    else if(ui->pushButton_connect->text() == "停止监听")
+    {
+        for(int i=0; i<clientSock.length(); i++)
+        {
+            clientSock.at(i)->disconnectFromHost();
+//            if(clientSock.at(i)->waitForDisconnected())
+                clientSock.removeAt(i);
+//            else
+//            {
+//                QMessageBox::warning(this,"警告","断开连接异常");
+//                break;
+//            }
+        }
+        delete mServer;
+        mServer = NULL;
+
+        ui->label_connect->setStyleSheet("background-color: rgb(206, 206, 206);border:1px solid#000000;border-radius:10px;");
+        ui->pushButton_connect->setText("开始监听");
+    }
+    else if(ui->pushButton_connect->text() == "开始连接")
+    {
+        mSocket = new QTcpSocket();
+        mSocket->connectToHost(ui->lineEdit_IP->text(),ui->lineEdit_port->text().toInt());
+        if(mSocket->waitForConnected(1000))
+        {
+            connect(mSocket,SIGNAL(readyRead()),this,SLOT(read_data()));
+            connect(mSocket,SIGNAL(disconnected()),this, SLOT(disConnect()));
+            ui->pushButton_connect->setText("断开连接");
+            ui->label_connect->setStyleSheet("background-color: rgb(00, 255, 0);border:1px solid#000000;border-radius:10px;");
+        }
+        else
+            QMessageBox::warning(this, "警告","连接错误");
+    }
+    else if(ui->pushButton_connect->text() == "断开连接")
+    {
+        mSocket->disconnectFromHost();
+        delete mSocket;
+        mSocket = NULL;
+        ui->pushButton_connect->setText("开始连接");
+        ui->label_connect->setStyleSheet("background-color: rgb(206, 206, 206);border:1px solid#000000;border-radius:10px;");
+    }
+}
+
+// 发送数据
+void MainWin::on_pushButton_snd_clicked()
+{
+    QString peerAddr;
+    QString filePath;
+    QString message;
+    QString str = ui->plainTextEdit_sndmsg->document()->toPlainText();
+    if(str == NULL)
+        return;
+
+    int row = ui->comboBox_client->currentIndex();
+    if(str.mid(1,2) == ":/")
+    {
+        filePath = str;
+        QFileInfo info = QFileInfo(filePath);
+        quint64 fileSize = info.size();
+        qDebug()<<"fileSize:"<<fileSize;
+
+        //添加到文件列表
+        FileList *list = new FileList("right", ui->listWidget_rcvmsg);
+        list->setFilePath(filePath);
+        list->setFileSize(fileSize);
+
+        if(mode == TcpServer)
+        {
+            peerAddr = ui->comboBox_client->currentText();
+            clientSock.at(row)->write(QString("#snd#"+filePath+"("+QString("%1").arg(fileSize)+")").toUtf8());
+            list->setpeerAddr(peerAddr);
+        }
+        else if(mode == TcpClient)
+        {
+            peerAddr = ui->lineEdit_IP->text();
+            mSocket->write(QString("#snd#"+filePath+"("+fileSize+")").toUtf8());
+            list->setpeerAddr(peerAddr);
+        }
+        fileList.append(list);
+
+        //显示到数据接收区
+        QListWidgetItem *fileItem  = new QListWidgetItem();
+        fileItem->setSizeHint(list->sizeHint());
+
+        int row = ui->listWidget_rcvmsg->count();
+        ui->listWidget_rcvmsg->addItem(fileItem);
+        ui->listWidget_rcvmsg->setItemWidget(fileItem, list);
+        ui->listWidget_rcvmsg->item(row)->setText(filePath);
+        ui->listWidget_rcvmsg->item(row)->setTextAlignment(Qt::AlignRight);
+
+        ui->plainTextEdit_sndmsg->clear();
+    }
+    else
+    {
+        message = str;
+        if(mode == TcpServer)
+            clientSock.at(row)->write(str.toUtf8());
+        else if(mode == TcpClient)
+            mSocket->write(str.toUtf8());
+
+        QListWidgetItem *strItem = new QListWidgetItem(str);
+        strItem->setTextAlignment(Qt::AlignRight);
+        ui->listWidget_rcvmsg->addItem(strItem);
+
+        if(!ui->checkBox_autoSnd->isChecked())
+            ui->plainTextEdit_sndmsg->clear();
+    }
+    QString cmd = QString("insert into record (ipAddr,message,filePath) values('%1','%2','%3');").arg(peerAddr).arg(message).arg(filePath);
+    QSqlQuery query;
+    query.exec(cmd);
+}
+
+// 接收数据
+void MainWin::read_data()
+{
+    QString  cmd;
+    QSqlQuery query;
+
+    QTcpSocket *sock = static_cast<QTcpSocket *>(sender());
+    QString senderIP = sock->peerAddress().toString();
+
+    QString msg = sock->readAll();
+
+    qDebug()<<msg;
+    //收到对方发来的文件
+    if(msg.mid(0,5) == "#snd#")
+    {
+        msg.remove(0,5);
+        int i = msg.indexOf("(");
+        QString filePath = msg.mid(0,i);
+        qDebug()<<"filePath:"<<filePath;
+
+        int fileSize = msg.remove(filePath).remove("(").remove(")").toInt();
+        qDebug()<<"fileSize:"<<msg.remove(filePath).remove("(").remove(")").toInt();
+
+        QString fileName = filePath.right(filePath.size()-filePath.lastIndexOf('/')-1);
+        qDebug() << "fileName:" << fileName;
+       // fileSize = sizeConvert(fileSize);
+
+        //添加到文件列表
+        FileList *list = new FileList("left", ui->listWidget_rcvmsg);
+        list->setpeerAddr(sock->peerAddress().toString());
+        list->setFilePath(filePath);
+        list->setFileSize(fileSize);
+        fileList.append(list);
+
+        QListWidgetItem *fileItem  = new QListWidgetItem();
+        fileItem->setSizeHint(list->sizeHint());
+
+        int itemCnt = ui->listWidget_rcvmsg->count();
+        ui->listWidget_rcvmsg->addItem(fileItem);
+        ui->listWidget_rcvmsg->setItemWidget(fileItem, list);
+        ui->listWidget_rcvmsg->item(itemCnt)->setText(senderIP+"\n"+fileName+"("+sizeConvert(fileSize)+")");
+        ui->listWidget_rcvmsg->item(itemCnt)->setTextAlignment(Qt::AlignLeft);
+
+        cmd = QString("insert into record (ipAddr,filePath,fileSize) values('%1','%2','%3');").arg(senderIP).arg(filePath).arg(fileSize);
+        query.exec(cmd);
+    }
+    //对方发出接收文件响应
+    else if(msg.mid(0,5) == "#rcv#")
+    {
+        msg.remove(0,5);
+        QString filePath = msg;
+
+      //  qDebug()<<"filePath:"+filePath;
+        qint8 listIndex = fileList.count();
+       // qDebug()<<listIndex;
+        for(; listIndex>0; listIndex--)
+        {
+            if(fileList.at(listIndex-1)->getFilePath() == filePath  && fileList.at(listIndex-1)->getpeerAddr() == sock->peerAddress().toString())
+            {
+               // qDebug()<< "listIndex:"<<listIndex;
+                //当数据发送出会发送bytesWritten，触发sendFile()持续发送文件数据
+                fileList.at(listIndex-1)->setFileSock(sock);
+                fileList.at(listIndex-1)->openFile();
+                fileList.at(listIndex-1)->sendFile();
+                break;
+            }
+        }
+    }
+    //收到的是消息
+    else
+    {
+        ui->listWidget_rcvmsg->addItem(msg);
+        QString cmd = QString("insert into record (ipAddr,message) values('%1','%2');").arg(senderIP).arg(msg);
+        QSqlQuery query;
+        query.exec(cmd);
+    }
+
+}
+
+//清空接收区数据
+void MainWin::on_pushButton_clear_clicked()
+{
+    ui->listWidget_rcvmsg->clear();
+    QSqlQuery query;
+    query.exec("delete from record;");
+}
+
+//自动发送
+void MainWin::on_checkBox_autoSnd_clicked(bool checked)
+{
+    if(checked)
+    {
+        timer.start(ui->lineEdit_time->text().toInt());
+        connect(&timer, SIGNAL(timeout()), this, SLOT(on_pushButton_snd_clicked()));
+    }
+    else
+        timer.stop();
+}
+
+//浏览文件夹
+void MainWin::on_pushButton_file_clicked()
+{
+    QString filepath = QFileDialog::getOpenFileName(this);
+    ui->plainTextEdit_sndmsg->appendPlainText(filepath);
+}
+
+//保存文件
+void MainWin::on_listWidget_rcvmsg_doubleClicked(const QModelIndex &index)
+{
+    qint8 currentRow = index.row()+1;
+    qDebug()<<"currentRow="<<currentRow;
+    QString cmd = QString("select ipAddr,filePath,fileSize from record where rowid=%1;").arg(currentRow);
+    QSqlQuery query;
+    query.exec(cmd);
+    if(query.next())
+    {
+        QString filePath = query.value(1).toString();
+        QString savePath = QFileDialog::getSaveFileName(this);
+        qDebug()<<savePath;
+        if(savePath != NULL)
+        {
+            if(mode == TcpServer)
+            {
+                qint8 clientIndex = 0;
+                for(qint8 i=0; i<clientSock.count(); i++)
+                {
+                    if(clientSock.at(i)->peerAddress().toString() == query.value(0).toString())
+                    {
+                        clientIndex = i;
+                        break;
+                    }
+                }
+                clientSock.at(clientIndex)->write(QString("#rcv#"+filePath).toUtf8());
+            }
+            else if(mode == TcpClient)
+            {
+                mSocket->write(QString("#rcv#"+filePath).toUtf8());
+            }
+
+            qint8 listIndex = fileList.count();
+           // qDebug()<<listIndex;
+            for(; listIndex>0; listIndex--)
+            {
+                if(fileList.at(listIndex-1)->getFilePath() == filePath  && fileList.at(listIndex-1)->getpeerAddr() == sock->peerAddress().toString())
+                {
+                    fileList.at(listIndex-1)->setFileSize(query.value(2).toString());
+                    break;
+                }
+            }
+
+            cmd.clear();
+            cmd = QString("update record set savePath='%1' where rowid=%2;").arg(savePath).arg(currentRow);
+            query.exec(cmd);
+        }
+    }
+}
+
+QString MainWin::sizeConvert(quint64 value)
+{
+    if(value>=1024 && value<1024*1024)
+        return QString("%1KB").arg(QString::number(value/1024.0,'f',2));
+    else if(value>=1024*1024)
+        return QString("%1MB").arg(QString::number(value/1024.0/1024.0,'f',2));
+    else
+        return QString("%1B").arg(value);
+}
+
